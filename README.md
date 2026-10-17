@@ -143,8 +143,7 @@ Diagnostics without the menu bar app (quit it first, `just stop`):
 4. The rectangles go to the MS9132 as USB bulk transfers through IOKit; control commands go as HID reports.
    No libusb, no kernel extension, no DriverKit.
 
-The protocol notes (in Russian) are in [InnoViewDualMonitorDriver/NOTES.md](InnoViewDualMonitorDriver/NOTES.md).
-They were checked against the Linux `ms912x` driver, the vendor's macOS driver and the hardware.
+The protocol was checked against the Linux `ms912x` driver, the vendor's macOS driver and the hardware.
 
 ## Keywords
 
