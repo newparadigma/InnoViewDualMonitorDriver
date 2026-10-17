@@ -19,7 +19,6 @@ ms_rect ms_rect_union(ms_rect a, ms_rect b);
 // Clamp to [0,w)x[0,h) and widen horizontally to MS_RECT_ALIGN.
 ms_rect ms_rect_align(ms_rect r, int w, int h);
 
-int ms_frame_init(void);
 int ms_bytes_per_pixel(uint8_t pixfmt);
 
 // Where rect r of a w x h image lands after rotating the image by 180 degrees.
@@ -28,7 +27,7 @@ static inline ms_rect ms_rect_rot180(ms_rect r, int w, int h) {
 }
 
 // Converts rect r of a BGRA image into the same rect of dst (chip format).
-// r must be aligned (see ms_rect_align).
+// r must be aligned (see ms_rect_align); for UYVY r.w must be even.
 int ms_convert_rect(const uint8_t *bgra, size_t src_stride, uint8_t *dst, size_t dst_stride, ms_rect r,
                     uint8_t pixfmt);
 

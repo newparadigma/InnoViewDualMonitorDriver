@@ -11,7 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define KEEP_LOGS 20
+#define KEEP_LOGS 20  // including the current one
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static FILE *g_file;
@@ -31,7 +31,7 @@ static void prune_old_logs(void) {
     closedir(d);
     qsort(names, n, sizeof names[0], cmp_names);
     for (int i = 0; i < n; i++) {
-        if (i < n - KEEP_LOGS) {
+        if (i < n - (KEEP_LOGS - 1)) {  // room for the log about to be created
             char p[2048];
             snprintf(p, sizeof p, "%s/%s", g_dir, names[i]);
             unlink(p);

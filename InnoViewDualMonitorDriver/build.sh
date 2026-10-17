@@ -4,6 +4,8 @@
 # login item.
 #   ./build.sh       build and install
 #   ./build.sh run   also restart the running copy
+# CODESIGN_IDENTITY=<name of a code signing certificate> signs with it instead
+# of ad hoc (see below).
 set -eu
 cd "$(dirname "$0")"
 
@@ -14,6 +16,8 @@ mkdir -p "$OBJ" "$APP/Contents/MacOS"
 
 CFLAGS="-O2 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0 -Isrc"
 
+# Objects of removed or renamed sources must not end up in the link.
+rm -f "$OBJ"/*.o
 for f in src/*.c; do
     clang -std=c11 $CFLAGS -c "$f" -o "$OBJ/$(basename "$f" .c).o"
 done
@@ -23,8 +27,8 @@ done
 
 clang -mmacosx-version-min=14.0 "$OBJ"/*.o -o "$APP/Contents/MacOS/InnoViewDualMonitorDriver" \
     -framework AppKit -framework IOKit -framework CoreFoundation -framework CoreGraphics \
-    -framework CoreMedia -framework CoreVideo -framework ScreenCaptureKit -framework Accelerate \
-    -framework ServiceManagement -framework Metal
+    -framework CoreMedia -framework CoreVideo -framework ScreenCaptureKit -framework ServiceManagement \
+    -framework Metal
 
 cp Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
@@ -42,11 +46,23 @@ fi
 mkdir -p "$APP/Contents/Resources"
 cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
 
-# Ad-hoc signature with an identifier-based designated requirement, so the
-# "Screen Recording" permission survives rebuilds (the default ad-hoc
-# requirement is the cdhash, which changes with every build).
-codesign --force --sign - --identifier com.newparadigma.innoviewdualmonitordriver \
-    -r='designated => identifier "com.newparadigma.innoviewdualmonitordriver"' "$APP"
+# The "Screen Recording" permission belongs to the designated requirement, so
+# it has to stay the same across rebuilds.
+# - With CODESIGN_IDENTITY (for example a self-signed "Code Signing"
+#   certificate from Keychain Access) the requirement names the identifier
+#   and the certificate: only builds signed with it get the permission.
+# - Without it: ad hoc, and the requirement names only the identifier (the
+#   default ad hoc requirement is the cdhash, which changes with every build).
+#   Any ad hoc signed program can claim that identifier and get the
+#   permission without asking.
+BUNDLE_ID=com.newparadigma.innoviewdualmonitordriver
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    codesign --force --sign "$CODESIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP"
+else
+    codesign --force --sign - --identifier "$BUNDLE_ID" -r="designated => identifier \"$BUNDLE_ID\"" "$APP"
+    echo "note: ad hoc signature, any program signed as $BUNDLE_ID shares its Screen Recording permission;"
+    echo "      set CODESIGN_IDENTITY to sign with a certificate"
+fi
 # The icon cache goes by the date of the bundle directory itself, which
 # rebuilding its contents doesn't change; without this the old icon stays.
 touch "$APP"

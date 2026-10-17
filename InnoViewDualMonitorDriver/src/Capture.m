@@ -94,10 +94,6 @@ NSString *const MSCaptureErrorDomain = @"MSCapture";
     }];
 }
 
-- (BOOL)running {
-    return _stream != nil;
-}
-
 - (void)stopWithCompletion:(void (^)(void))completion {
     SCStream *stream = _stream;
     _stream = nil;

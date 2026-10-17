@@ -91,7 +91,17 @@ Not checked yet:
    If you later take the Screen Recording permission away, macOS lets the running app keep it until it quits
    ("Quit & Reopen" or "Later"). After that the app starts without the top screen until the permission is back.
 
-The copy in `~/Applications` adds itself to Login Items; the "Launch at Login" menu item turns that off.
+The copy in `~/Applications` adds itself to Login Items once; the "Launch at Login" menu item turns that off, and
+removing it in System Settings → General → Login Items also sticks.
+
+The build signs the app ad hoc. The Screen Recording permission then belongs to anything signed ad hoc with the
+app's identifier (`com.newparadigma.innoviewdualmonitordriver`), not only to this build. To tie it to your own
+certificate (a self-signed "Code Signing" certificate from Keychain Access → Certificate Assistant is enough):
+```bash
+CODESIGN_IDENTITY="My Code Signing" ./InnoViewDualMonitorDriver/build.sh run
+```
+After switching between the two, reset the permission as described under
+[Troubleshooting](#troubleshooting).
 
 ## Using it
 

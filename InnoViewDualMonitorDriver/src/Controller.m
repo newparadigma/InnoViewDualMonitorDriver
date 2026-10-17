@@ -15,7 +15,7 @@
 #include "log.h"
 #include "ms9132.h"
 
-#define DISPLAY_GRACE_S 5.0  // keep the virtual display this long after unplug
+#define DISPLAY_GRACE_S 5.0  // keep the virtual display this long after unplug or HPD loss
 #define HPD_CHECK_S 0.5  // status register poll, as the vendor driver
 #define HPD_MISSES 2     // consecutive HPD-low reads before the monitor counts as gone
 // The screen goes dark a few seconds after the last transfer, so while the
@@ -61,6 +61,7 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     uint8_t _fmt;      // format of _shadow
     uint8_t _wantFmt;  // format chosen at startup
     uint64_t _gen;     // bumped whenever _shadow is reallocated or invalidated
+    uint64_t _captureEpoch;  // frames of captures started before the last bump are dropped
     BOOL _frameValid;
     BOOL _resync;      // both chip buffers need the whole frame again
     BOOL _rotate180;   // panel is upside down (from the status register)
@@ -99,7 +100,7 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     MSVirtualDisplay *_vd;
     MSCapture *_capture;
     BOOL _captureStarting, _accessRequested, _retryScheduled, _needsRelaunch;
-    BOOL _displaysAsleep;
+    BOOL _displaysAsleep, _displayFailed;
     double _wakeTime;
     NSString *_lastCaptureError;
     int _notFoundRetries;
@@ -128,7 +129,6 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     _pkt = valloc(_pktCap);
     _threadDone = dispatch_semaphore_create(0);
     _sleepDone = dispatch_semaphore_create(0);
-    ms_frame_init();
     ms_global_init(msx_log_line);
     CGDisplayRegisterReconfigurationCallback(display_reconfigured, (__bridge void *)self);
     if (_wantFmt == MS_PIXFMT_RGB888) msx_log("experimental RGB888 mode enabled");
@@ -190,6 +190,10 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
 
 - (void)systemWillSleep {
     msx_log("system will sleep");
+    // Also when the displays did not report sleeping first.
+    pthread_mutex_lock(&_fl);
+    [self discardFrames];
+    pthread_mutex_unlock(&_fl);
     while (dispatch_semaphore_wait(_sleepDone, DISPATCH_TIME_NOW) == 0) {
     }
     [self setFlag:&_sleepReq to:YES];
@@ -199,6 +203,12 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
 - (void)systemDidWake {
     msx_log("system did wake");
     [self setFlag:&_sleepReq to:NO];
+    // Frames are dropped since "will sleep". With the displays asleep the
+    // capture restarts on their wake; otherwise nothing else restarts it.
+    if (!_displaysAsleep) {
+        _wakeTime = now_s();
+        [self restartCapture];
+    }
 }
 
 - (void)displaysDidSleep {
@@ -206,9 +216,17 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     _displaysAsleep = YES;  // no capture restarts until wake
     pthread_mutex_lock(&_fl);
     _blankReq = YES;
-    _frameValid = NO;  // never show the pre-sleep picture after wake: the lock screen may be up
+    [self discardFrames];
     pthread_cond_broadcast(&_fc);
     pthread_mutex_unlock(&_fl);
+}
+
+// Called with _fl held. The current picture is never shown again (after
+// sleep the lock screen may be up), and frames still arriving from the
+// running capture are dropped: only a capture started afterwards counts.
+- (void)discardFrames {
+    _captureEpoch++;
+    _frameValid = NO;
 }
 
 // NSWorkspace reports display wake up to ~0.65 s after WindowServer powers the
@@ -220,13 +238,7 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     _displaysAsleep = NO;
     _wakeTime = now_s();
     [self setFlag:&_blankReq to:NO];
-    // A fresh stream starts with a complete frame, even if nothing changes on screen.
-    MSCapture *old = _capture;
-    _capture = nil;
-    [old stopWithCompletion:^{
-      [self startCapture];
-    }];
-    if (!old) [self startCapture];
+    [self restartCapture];
 }
 
 #pragma mark - UI snapshot
@@ -347,7 +359,6 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
                 continue;
             }
         }
-        lastPresent = now_s();
 
         if (!_sinkPresent) {
             uint8_t raw = 0;
@@ -358,6 +369,8 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
             }
             if (r == 0) {
                 [self setState:MSStateWaitSink detail:@""];
+                // As the vendor driver: no monitor, no display (windows would be stranded on it).
+                if (now_s() - lastPresent > DISPLAY_GRACE_S) [self setDisplayWanted:NO];
                 [self waitFor:0.5];
                 continue;
             }
@@ -369,6 +382,7 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
             [self readEdid];
             [self setDisplayWanted:YES];
         }
+        lastPresent = now_s();
 
         int r = [self streamStep];
         if (r < 0) [self deviceFailed:r what:"stream"];
@@ -643,11 +657,15 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     return YES;
 }
 
-- (void)ingestFrame:(CVPixelBufferRef)pb dirty:(const CGRect *)dirty count:(size_t)n {
+- (void)ingestFrame:(CVPixelBufferRef)pb dirty:(const CGRect *)dirty count:(size_t)n epoch:(uint64_t)epoch {
     if (CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_32BGRA) return;
     int w = (int)CVPixelBufferGetWidth(pb), h = (int)CVPixelBufferGetHeight(pb);
 
     pthread_mutex_lock(&_fl);
+    if (epoch != _captureEpoch) {  // a late frame of a capture that no longer counts
+        pthread_mutex_unlock(&_fl);
+        return;
+    }
     if ((!_shadow || w != _sw || h != _sh || _fmt != _wantFmt) && ![self allocShadowWidth:w height:h]) {
         pthread_mutex_unlock(&_fl);
         return;
@@ -738,19 +756,38 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
             [self waitForPermission];
             return;
         }
-        _vd = [[MSVirtualDisplay alloc] initWithName:@"InnoView USB"
-                                               modes:[self supportedSizes]
-                                              serial:_edidSerial ? _edidSerial : 1];
-        if (!_vd) {
-            [self setState:MSStateError detail:@"could not create the virtual display"];
+        MSVirtualDisplay *vd = [[MSVirtualDisplay alloc] initWithName:@"InnoView USB"
+                                                                modes:[self supportedSizes]
+                                                               serial:_edidSerial ? _edidSerial : 1];
+        if (!vd) {
+            // Shown in the menu: a state set from here would be overwritten by the device thread.
+            _displayFailed = YES;
+            [self notify];
+            [self scheduleCaptureRetry:5.0];
             return;
         }
-        _displayID = _vd.displayID;
+        _displayFailed = NO;
+        __weak MSController *weakSelf = self;
+        __weak MSVirtualDisplay *weakVd = vd;
+        vd.terminated = ^{
+          [weakSelf displayTerminated:weakVd];
+        };
+        _vd = vd;
+        _displayID = vd.displayID;
         [self startCapture];
-    } else if (!wanted && _vd) {
-        [self removeDisplay];
+    } else if (!wanted) {
+        _displayFailed = NO;
+        if (_vd) [self removeDisplay];
     }
     [self notify];
+}
+
+// The system removed the virtual display by itself: forget it and create a new one.
+- (void)displayTerminated:(MSVirtualDisplay *)vd {
+    if (!vd || vd != _vd) return;
+    [self removeDisplay];
+    [self notify];
+    [self scheduleCaptureRetry:1.0];
 }
 
 - (void)removeDisplay {
@@ -758,12 +795,15 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     _capture = nil;
     _vd = nil;
     _displayID = 0;
-    _streamSize = CGSizeZero;
     pthread_mutex_lock(&_fl);
-    _frameValid = NO;
+    [self discardFrames];
     _screenOffReq = YES;
     pthread_cond_broadcast(&_fc);
     pthread_mutex_unlock(&_fl);
+}
+
+- (BOOL)displayFailed {
+    return _displayFailed;
 }
 
 - (BOOL)rotated {
@@ -780,10 +820,11 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
         return;
     }
     _captureStarting = YES;
+    uint64_t epoch = [self captureEpoch];
     __weak MSController *weakSelf = self;
     MSCapture *cap = [[MSCapture alloc] initWithDisplay:_vd.displayID
                                                 handler:^(CVPixelBufferRef pb, const CGRect *dirty, size_t n) {
-                                                  [weakSelf ingestFrame:pb dirty:dirty count:n];
+                                                  [weakSelf ingestFrame:pb dirty:dirty count:n epoch:epoch];
                                                 }];
     __weak MSCapture *weakCap = cap;
     cap.stoppedWithError = ^(NSError *error) {
@@ -796,8 +837,12 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
       MSController *s = weakSelf;
       if (!s) return;
       s->_captureStarting = NO;
-      if (!s->_vd || s->_vd.displayID != cap.displayID) {
+      if (!error && (!s->_vd || s->_vd.displayID != cap.displayID || [s captureEpoch] != epoch)) {
+          // The display was replaced or the frames were discarded while starting
+          // (startCapture calls meanwhile returned early): start over. A failed
+          // start goes through the usual error handling below instead.
           [cap stopWithCompletion:nil];
+          [s startCapture];
           return;
       }
       if (error) {
@@ -829,9 +874,27 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
       s->_lastCaptureError = nil;
       s->_captureDenied = NO;
       s->_capture = cap;
-      s->_streamSize = cap.size;
       [s notify];
+      // A mode change while starting went unnoticed (no capture to restart then).
+      [s displayReconfigured:cap.displayID];
     }];
+}
+
+- (uint64_t)captureEpoch {
+    pthread_mutex_lock(&_fl);
+    uint64_t e = _captureEpoch;
+    pthread_mutex_unlock(&_fl);
+    return e;
+}
+
+// A fresh stream starts with a complete frame, even if nothing changes on screen.
+- (void)restartCapture {
+    MSCapture *old = _capture;
+    _capture = nil;
+    [old stopWithCompletion:^{
+      [self startCapture];
+    }];
+    if (!old) [self startCapture];
 }
 
 // Without permission every ScreenCaptureKit call shows a system dialog, so ask
@@ -868,7 +931,7 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
       if (self->_vd)
           [self startCapture];
       else
-          [self syncDisplay];  // still waiting for the permission to create the display
+          [self syncDisplay];  // no display yet: permission, failed creation or removed by the system
     });
 }
 
@@ -877,11 +940,7 @@ static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     CGSize size = [self currentSize];
     if (CGSizeEqualToSize(size, _capture.size) || CGSizeEqualToSize(size, CGSizeZero)) return;
     msx_log("display mode changed to %.0fx%.0f, restarting capture", size.width, size.height);
-    MSCapture *old = _capture;
-    _capture = nil;
-    [old stopWithCompletion:^{
-      [self startCapture];
-    }];
+    [self restartCapture];
 }
 
 static void display_reconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *ctx) {

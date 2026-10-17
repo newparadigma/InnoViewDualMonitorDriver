@@ -93,7 +93,7 @@
 - (void)refresh {
     MSState s = _controller.state;
     NSString *symbol = @"display";
-    if (s == MSStateBusy || s == MSStateError || _controller.captureDenied)
+    if (s == MSStateBusy || s == MSStateError || _controller.captureDenied || _controller.displayFailed)
         symbol = @"exclamationmark.triangle";
     else if (s == MSStateStreaming && _controller.usbSpeed == 2)
         symbol = @"display.trianglebadge.exclamationmark";
@@ -143,6 +143,8 @@
     }
     if (s == MSStateBusy)
         [menu addItem:[self info:@"Quit MSDisplayManager (its menu bar icon → Exit)"]];
+    if (_controller.displayFailed)
+        [menu addItem:[self info:@"Could not create the virtual display, retrying… (see the log)"]];
     if (_controller.captureDenied) {
         [menu addItem:[NSMenuItem separatorItem]];
         [menu addItem:[self action:@"No Screen Recording permission — Open Settings…"
@@ -229,7 +231,13 @@
         @"-c", @"while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$2\"", @"sh",
         [NSString stringWithFormat:@"%d", NSProcessInfo.processInfo.processIdentifier], NSBundle.mainBundle.bundlePath
     ];
-    [task launchAndReturnError:nil];
+    NSError *err = nil;
+    if (![task launchAndReturnError:&err]) {
+        // Without the helper nothing would start the app again: stay running.
+        msx_log("relaunch failed: %s", err.localizedDescription.UTF8String);
+        NSBeep();
+        return;
+    }
     [NSApp terminate:nil];
 }
 
@@ -242,15 +250,20 @@
            [dir isEqualToString:[NSHomeDirectory() stringByAppendingPathComponent:@"Applications"]];
 }
 
+// Registers once: a login item the user removes later (menu or System Settings) stays removed.
 - (void)setupLoginItem {
-    if (![self isInstalled] || [NSUserDefaults.standardUserDefaults boolForKey:@"LoginItemOff"]) return;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (![self isInstalled] || [defaults boolForKey:@"LoginItemOff"] || [defaults boolForKey:@"LoginItemSetUp"]) return;
     SMAppService *svc = SMAppService.mainAppService;
-    if (svc.status == SMAppServiceStatusEnabled) return;
-    NSError *err = nil;
-    if ([svc registerAndReturnError:&err])
+    if (svc.status != SMAppServiceStatusEnabled) {
+        NSError *err = nil;
+        if (![svc registerAndReturnError:&err]) {
+            msx_log("login item registration failed: %s", err.localizedDescription.UTF8String);
+            return;
+        }
         msx_log("login item registered");
-    else
-        msx_log("login item registration failed: %s", err.localizedDescription.UTF8String);
+    }
+    [defaults setBool:YES forKey:@"LoginItemSetUp"];
 }
 
 - (void)toggleLoginItem:(id)sender {

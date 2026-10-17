@@ -13,6 +13,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property(nonatomic, readonly) CGDirectDisplayID displayID;
 
+// Called on the main queue when the system removes the display by itself.
+@property(nonatomic, copy, nullable) void (^terminated)(void);
+
 @end
 
 NS_ASSUME_NONNULL_END

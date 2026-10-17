@@ -97,7 +97,7 @@ int msx_pattern(int seconds, int full) {
     uint8_t *img = malloc((size_t)W * H * 4);
     uint8_t *yuv = malloc((size_t)W * H * 2);
     uint8_t *pkt = malloc(ms_packet_size(W, H, 2));
-    if (!img || !yuv || !pkt || ms_frame_init() < 0) goto out;
+    if (!img || !yuv || !pkt) goto out;
 
     int r;
     if ((r = ms_power_on(dev, 1)) < 0 || (r = ms_video_on(dev, 0)) < 0 || (r = ms_screen_on(dev, 0)) < 0) {

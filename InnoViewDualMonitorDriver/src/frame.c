@@ -1,15 +1,11 @@
 #include "frame.h"
 
-#include <Accelerate/Accelerate.h>
 #include <string.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 
 #include "ms9132.h"
-
-static vImage_ARGBToYpCbCr g_yuv;
-static int g_ready;
 
 static int imin(int a, int b) { return a < b ? a : b; }
 static int imax(int a, int b) { return a > b ? a : b; }
@@ -31,61 +27,37 @@ ms_rect ms_rect_align(ms_rect r, int w, int h) {
     return (ms_rect){x0, y0, x1 - x0, y1 - y0};
 }
 
-int ms_frame_init(void) {
-    if (g_ready) return 0;
-    // BT.601, limited range, as the vendor driver does.
-    vImage_YpCbCrPixelRange range = {16, 128, 235, 240, 235, 16, 240, 16};
-    vImage_Error e = vImageConvert_ARGBToYpCbCr_GenerateConversion(
-        kvImage_ARGBToYpCbCrMatrix_ITU_R_601_4, &range, &g_yuv, kvImageARGB8888, kvImage422CbYpCrYp8, kvImageNoFlags);
-    if (e != kvImageNoError) return (int)e;
-    g_ready = 1;
-    return 0;
-}
-
 int ms_bytes_per_pixel(uint8_t pixfmt) { return pixfmt == MS_PIXFMT_RGB888 ? 3 : 2; }
 
-static int convert(const uint8_t *src_px, size_t src_stride, uint8_t *dst_px, size_t dst_stride, int w, int h,
-                   uint8_t pixfmt) {
-    vImage_Buffer src = {(void *)src_px, (vImagePixelCount)h, (vImagePixelCount)w, src_stride};
-    vImage_Buffer out = {dst_px, (vImagePixelCount)h, (vImagePixelCount)w, dst_stride};
-    vImage_Error e;
-    if (pixfmt == MS_PIXFMT_RGB888) {
-        e = vImageConvert_BGRA8888toRGB888(&src, &out, kvImageDoNotTile);
-    } else {
-        static const uint8_t bgra_to_argb[4] = {3, 2, 1, 0};
-        e = vImageConvert_ARGB8888To422CbYpCrYp8(&src, &out, &g_yuv, bgra_to_argb, kvImageDoNotTile);
-    }
-    return e == kvImageNoError ? 0 : (int)e;
-}
-
-int ms_convert_rect(const uint8_t *bgra, size_t src_stride, uint8_t *dst, size_t dst_stride, ms_rect r,
-                    uint8_t pixfmt) {
-    if (ms_rect_empty(r)) return 0;
-    int bpp = ms_bytes_per_pixel(pixfmt);
-    return convert(bgra + (size_t)r.y * src_stride + (size_t)r.x * 4, src_stride,
-                   dst + (size_t)r.y * dst_stride + (size_t)r.x * bpp, dst_stride, r.w, r.h, pixfmt);
-}
-
-// Rotated conversion in one pass: each output row is produced from a source
-// row read backwards. Same result as vImage (BT.601 limited range, 4:2:2
-// chroma = rounded average of the pixel pair; checked against it), but
-// without a separate rotation pass over the BGRA data.
+// Row conversion, optionally reading the source row backwards, which rotates
+// the image by 180 degrees in the same pass. BT.601 limited range as the
+// vendor driver, 4:2:2 chroma = rounded average of the pixel pair. Matches
+// vImage to within 1 and the Metal shader (GPUConverter.m) exactly.
 //
 // Fixed point, Q14: Y  = 16  + (4207 R + 8260 G + 1604 B) / 2^14
 //                   Cb = 128 + (-2428 R - 4768 G + 7196 B) / 2^14
 //                   Cr = 128 + (7196 R - 6026 G - 1170 B) / 2^14
 enum { YR = 4207, YG = 8260, YB = 1604, UR = -2428, UG = -4768, UB = 7196, VR = 7196, VG = -6026, VB = -1170 };
 
-static inline uint8_t clamp_u8(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
+#define ALWAYS_INLINE static inline __attribute__((always_inline))
 
-// dst pixel i (UYVY) <- src pixel n-1-i (BGRA); n even.
-static void row_uyvy_reversed(const uint8_t *src, int n, uint8_t *dst) {
+ALWAYS_INLINE uint8_t clamp_u8(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
+
+#if defined(__ARM_NEON)
+ALWAYS_INLINE uint8x16_t rev_u8x16(uint8x16_t v) {
+    v = vrev64q_u8(v);
+    return vextq_u8(v, v, 8);
+}
+#endif
+
+// dst pixel i (UYVY) <- src pixel i, or n-1-i if reversed (BGRA); n even.
+ALWAYS_INLINE void row_uyvy(const uint8_t *src, int n, uint8_t *dst, int reversed) {
     int i = 0;
 #if defined(__ARM_NEON)
     for (; i + 16 <= n; i += 16) {
-        uint8x16x4_t px = vld4q_u8(src + (size_t)(n - 16 - i) * 4);
-        uint8x16_t b = vrev64q_u8(px.val[0]), g = vrev64q_u8(px.val[1]), r = vrev64q_u8(px.val[2]);
-        b = vextq_u8(b, b, 8), g = vextq_u8(g, g, 8), r = vextq_u8(r, r, 8);
+        uint8x16x4_t px = vld4q_u8(src + (size_t)(reversed ? n - 16 - i : i) * 4);
+        uint8x16_t b = px.val[0], g = px.val[1], r = px.val[2];
+        if (reversed) b = rev_u8x16(b), g = rev_u8x16(g), r = rev_u8x16(r);
 
         uint16x8_t rl = vmovl_u8(vget_low_u8(r)), rh = vmovl_high_u8(r);
         uint16x8_t gl = vmovl_u8(vget_low_u8(g)), gh = vmovl_high_u8(g);
@@ -119,7 +91,7 @@ static void row_uyvy_reversed(const uint8_t *src, int n, uint8_t *dst) {
     }
 #endif
     for (; i + 2 <= n; i += 2) {
-        const uint8_t *p0 = src + (size_t)(n - 1 - i) * 4, *p1 = p0 - 4;
+        const uint8_t *p0 = src + (size_t)(reversed ? n - 1 - i : i) * 4, *p1 = reversed ? p0 - 4 : p0 + 4;
         int y0 = (YR * p0[2] + YG * p0[1] + YB * p0[0] + (1 << 13)) >> 14;
         int y1 = (YR * p1[2] + YG * p1[1] + YB * p1[0] + (1 << 13)) >> 14;
         int rs = p0[2] + p1[2], gs = p0[1] + p1[1], bs = p0[0] + p1[0];
@@ -130,40 +102,50 @@ static void row_uyvy_reversed(const uint8_t *src, int n, uint8_t *dst) {
     }
 }
 
-// dst pixel i (R G B) <- src pixel n-1-i (BGRA).
-static void row_rgb_reversed(const uint8_t *src, int n, uint8_t *dst) {
+// dst pixel i (R G B) <- src pixel i, or n-1-i if reversed (BGRA).
+ALWAYS_INLINE void row_rgb(const uint8_t *src, int n, uint8_t *dst, int reversed) {
     int i = 0;
 #if defined(__ARM_NEON)
     for (; i + 16 <= n; i += 16) {
-        uint8x16x4_t px = vld4q_u8(src + (size_t)(n - 16 - i) * 4);
+        uint8x16x4_t px = vld4q_u8(src + (size_t)(reversed ? n - 16 - i : i) * 4);
         uint8x16x3_t out;
-        for (int c = 0; c < 3; c++) {
-            uint8x16_t ch = vrev64q_u8(px.val[2 - c]);
-            out.val[c] = vextq_u8(ch, ch, 8);
-        }
+        for (int c = 0; c < 3; c++) out.val[c] = reversed ? rev_u8x16(px.val[2 - c]) : px.val[2 - c];
         vst3q_u8(dst + (size_t)i * 3, out);
     }
 #endif
     for (; i < n; i++) {
-        const uint8_t *p = src + (size_t)(n - 1 - i) * 4;
+        const uint8_t *p = src + (size_t)(reversed ? n - 1 - i : i) * 4;
         uint8_t *o = dst + (size_t)i * 3;
         o[0] = p[2], o[1] = p[1], o[2] = p[0];
     }
 }
 
+// Rows of r (source coordinates) land at rect d of dst, top to bottom when
+// upright, bottom to top and mirrored when rotated.
+ALWAYS_INLINE void convert_rows(const uint8_t *bgra, size_t src_stride, uint8_t *dst, size_t dst_stride, ms_rect r,
+                                ms_rect d, uint8_t pixfmt, int rotate) {
+    int bpp = ms_bytes_per_pixel(pixfmt);
+    for (int j = 0; j < r.h; j++) {
+        const uint8_t *s = bgra + (size_t)(rotate ? r.y + r.h - 1 - j : r.y + j) * src_stride + (size_t)r.x * 4;
+        uint8_t *o = dst + (size_t)(d.y + j) * dst_stride + (size_t)d.x * bpp;
+        if (pixfmt == MS_PIXFMT_RGB888)
+            row_rgb(s, r.w, o, rotate);
+        else
+            row_uyvy(s, r.w, o, rotate);
+    }
+}
+
+int ms_convert_rect(const uint8_t *bgra, size_t src_stride, uint8_t *dst, size_t dst_stride, ms_rect r,
+                    uint8_t pixfmt) {
+    if (ms_rect_empty(r)) return 0;
+    convert_rows(bgra, src_stride, dst, dst_stride, r, r, pixfmt, 0);
+    return 0;
+}
+
 int ms_convert_rect_rot180(const uint8_t *bgra, size_t src_stride, int w, int h, uint8_t *dst, size_t dst_stride,
                            ms_rect r, uint8_t pixfmt) {
     if (ms_rect_empty(r)) return 0;
-    ms_rect d = ms_rect_rot180(r, w, h);
-    int bpp = ms_bytes_per_pixel(pixfmt);
-    for (int j = 0; j < r.h; j++) {
-        const uint8_t *s = bgra + (size_t)(r.y + r.h - 1 - j) * src_stride + (size_t)r.x * 4;
-        uint8_t *o = dst + (size_t)(d.y + j) * dst_stride + (size_t)d.x * bpp;
-        if (pixfmt == MS_PIXFMT_RGB888)
-            row_rgb_reversed(s, r.w, o);
-        else
-            row_uyvy_reversed(s, r.w, o);
-    }
+    convert_rows(bgra, src_stride, dst, dst_stride, r, ms_rect_rot180(r, w, h), pixfmt, 1);
     return 0;
 }
 

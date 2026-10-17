@@ -81,8 +81,13 @@ static const CGSize kPanelMM = {344, 194};  // 15.6" 16:9
     desc.greenPrimary = CGPointMake(0.300, 0.600);
     desc.bluePrimary = CGPointMake(0.150, 0.060);
     desc.whitePoint = CGPointMake(0.3127, 0.3290);
+    __weak MSVirtualDisplay *weakSelf = self;
     desc.terminationHandler = ^(id a, id b) {
       msx_log("virtual display terminated by the system");
+      dispatch_async(dispatch_get_main_queue(), ^{
+        MSVirtualDisplay *s = weakSelf;
+        if (s.terminated) s.terminated();
+      });
     };
 
     _display = [(id<MSCGVirtualDisplay>)[dispCls alloc] initWithDescriptor:desc];

@@ -44,6 +44,7 @@ typedef struct {
     id<MTLCommandQueue> _queue;
     id<MTLComputePipelineState> _pipeline;
     CVMetalTextureCacheRef _cache;
+    CFAbsoluteTime _lastFlush;
 }
 
 - (nullable instancetype)init {
@@ -107,6 +108,12 @@ typedef struct {
     [cb commit];
     [cb waitUntilCompleted];
     CFRelease(ct);
+    // The cache frees textures of buffers no longer in use only when flushed.
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - _lastFlush >= 1.0) {
+        CVMetalTextureCacheFlush(_cache, 0);
+        _lastFlush = now;
+    }
     return cb.status == MTLCommandBufferStatusCompleted;
 }
 

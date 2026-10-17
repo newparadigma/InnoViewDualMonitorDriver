@@ -20,7 +20,6 @@ typedef void (^MSFrameHandler)(CVPixelBufferRef frame, const CGRect *_Nullable d
 @property(nonatomic, copy, nullable) void (^stoppedWithError)(NSError *error);
 @property(nonatomic, readonly) CGDirectDisplayID displayID;
 @property(nonatomic, readonly) CGSize size;  // pixels being captured
-@property(nonatomic, readonly) BOOL running;
 
 @end
 

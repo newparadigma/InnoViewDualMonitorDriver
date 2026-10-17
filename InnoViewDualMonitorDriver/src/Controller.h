@@ -36,8 +36,8 @@ typedef NS_ENUM(NSInteger, MSState) {
 @property(nonatomic, readonly) int usbSpeed;
 @property(nonatomic, readonly) BOOL captureDenied;
 @property(nonatomic, readonly) BOOL needsRelaunch;  // permission granted, capture needs a restart
+@property(nonatomic, readonly) BOOL displayFailed;  // the virtual display could not be created, retrying
 @property(nonatomic, readonly) CGDirectDisplayID displayID;  // 0 if none
-@property(nonatomic, readonly) CGSize streamSize;
 - (void)takeStatsFps:(double *)fps mbps:(double *)mbps;
 
 // The panel reports it is upside down; the driver flips the picture.
